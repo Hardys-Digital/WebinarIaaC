@@ -1,0 +1,22 @@
+{
+  "Parameters" : {
+    "DeploymentEnvironment": "prod",
+    "AvailabilityZone": "eu-central-1a",
+    "ImageId" : "ami-0fbc0724a0721c688",
+    "InstanceType": "t3.micro",
+    "InstanceName" : "PROD-ERP",
+    "InstanceProfile" : "Webinar-ADManagementRole",
+    "KeyName": "PROD-Webinar-KeyPair",
+    "TerminationProtectionInProduction": "false",
+    "DirectoryId" : "d-123456d789",
+    "DirectoryName" : "webinar.domain",
+    "DomainUser" : "user",
+    "SecretManagerSecret" : "password",
+    "myDomainNameServer" : "10.30.24.123",
+    "myDocumentName" : "EC2DomainJoin",
+    "DataDiskSize" : "50",
+    "BucketName" : "webinar-bucket",
+    "LogsRetentionInDays" : "30"
+
+  }
+}

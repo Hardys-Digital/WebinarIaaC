@@ -1,0 +1,524 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This template creates a single server installation of Microsoft Windows 2019
+  server with SQL 2019 Standard. It uses PowerShell scripts (need to be uploaded upfront to BucketName/Environment).
+  The scripts adds the server to the domain and gives the server a name
+  in the Active Directory according to the instance name.
+  It also adds additional volume. It installs and restore DB from backup. It communicates
+  with Secrets Manager to  obtain a AD Domain Admin password (this must be done before).
+  When the region is changed, update AMI ID.
+
+Metadata:
+  Author: FilipKamenar
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W2001 # Parameter is used in Sub
+
+#    *********************************************************************************
+#    ********************             Parameters                  ********************
+#    *********************************************************************************
+Parameters:
+  DeploymentEnvironment:
+    Type: String
+    Description: 'Environment where the instance will be deployed. Specify whether the environment is prod or test'
+    Default: 'test'
+    AllowedValues:
+      - 'prod'
+      - 'test'
+  AvailabilityZone:
+    Type: String
+    Description: 'AZ where resources will be deployed.'
+    Default: 'eu-central-1a'
+  ImageId:
+    Type: String
+    Description: 'AMI of this instance, default: WS 2019 SQL 2019 STD base - Frankfurt region'
+    Default: 'ami-0fbc0724a0721c688'
+  InstanceType:
+    Type: String
+    Description: 'Instance type'
+    Default: 't3.micro'
+  InstanceName:
+    Type: String
+    Description: 'Name of the instance'
+    Default: 'ERP'
+  InstanceProfile:
+    Type: String
+    Default: 'Webinar-ADManagementRole'
+  KeyName:
+    Type: String
+    Default: 'TEST-Webinar-KeyPair'
+  TerminationProtectionInProduction:
+    Type: String
+    Default: 'false'
+  DirectoryId:
+    Type: String
+    Default: 'd-123456d789'
+  DirectoryName:
+    Type: String
+    Default: 'webinar.domain'
+  DomainUser:
+    Type: String
+    Default: 'user'
+  SecretManagerSecret:
+    Type: String
+    Default: 'password'
+  myDomainNameServer:
+    Type: String
+    Description: 'Name of the document in Systems manager'
+    Default: '10.30.24.123'
+  myDocumentName:
+    Type: String
+    Description: 'Name of the document in Systems manager'
+    Default: 'EC2DomainJoin'
+  DataDiskSize:
+    Type: String
+    Description: '(GiB)'
+    Default: '50'
+  BucketName:
+    Type: String
+    Default: 'webinar-bucket'
+  LogsRetentionInDays:
+    Type: Number
+    Description: 'Specifies the number of days you want to retain log events in the specified log group.'
+    AllowedValues: [ 1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653 ]
+    Default: 30
+
+#    *********************************************************************************
+#    ********************             Conditions                  ********************
+#    *********************************************************************************
+Conditions:
+  isTestCondition: !Equals [ !Ref 'DeploymentEnvironment', 'test' ]
+
+#    *********************************************************************************
+#    ********************             Resources                   ********************
+#    *********************************************************************************
+Resources:
+  NetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Network interface for the ERP EC2 instance
+      GroupSet:
+      # PROD environment values are used because the test environment is not running 24/7
+        - !ImportValue 'PROD-Webinar-Network-DatabaseSecurityGroupID'
+      SubnetId: !ImportValue 'PROD-Webinar-Network-PrivateSubnetID'
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref 'InstanceName', 'NetworkInterface'] ]
+        - Key: Environment
+          Value: !Ref 'DeploymentEnvironment'
+
+  Volume1:
+    Type: "AWS::EC2::Volume"
+    Properties:
+      AvailabilityZone: !Ref 'AvailabilityZone'
+      VolumeType: 'gp2'
+      Size: !Ref 'DataDiskSize'
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref InstanceName, "Disk1"] ]
+        - Key: Environment
+          Value: !Ref 'DeploymentEnvironment'
+
+  CfnLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: !Join [ "-", [ !Ref 'InstanceName', CfnLogGroup] ]
+      RetentionInDays: !Ref 'LogsRetentionInDays'
+
+  ERP:
+     Type: AWS::EC2::Instance
+     Metadata:
+       AWS::CloudFormation::Authentication:
+         S3AccessCreds:
+           type: S3
+           roleName: !Ref 'InstanceProfile'
+           buckets:
+             - !Ref 'BucketName'
+       AWS::CloudFormation::Init:
+         configSets:
+           config:
+             - 00-ConfigureCWLogs
+             - 01-CopyAndCreateScripts
+             - 02-AttachVolumes
+             - 03-RenameComputer
+             - 04-RestoreDB
+             - 05-CopyFolders
+             - 06-Finalize
+         00-ConfigureCWLogs:
+           files:
+             C:\Program Files\Amazon\SSM\Plugins\awsCloudWatch\AWS.EC2.Windows.CloudWatch.json:
+               content: !Sub |
+                 {
+                   "EngineConfiguration": {
+                       "Components": [
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "ApplicationEventLog",
+                               "Parameters": {
+                                   "Levels": "7",
+                                   "LogName": "Application"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "SystemEventLog",
+                               "Parameters": {
+                                   "Levels": "7",
+                                   "LogName": "System"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.EventLog.EventLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "SecurityEventLog",
+                               "Parameters": {
+                                   "Levels": "7",
+                                   "LogName": "Security"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "EC2ConfigLog",
+                               "Parameters": {
+                                   "CultureName": "en-US",
+                                   "Encoding": "ASCII",
+                                   "Filter": "EC2ConfigLog.txt",
+                                   "LogDirectoryPath": "C:\\Program Files\\Amazon\\Ec2ConfigService\\Logs",
+                                   "TimeZoneKind": "UTC",
+                                   "TimestampFormat": "yyyy-MM-ddTHH:mm:ss.fffZ:"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CfnInitLog",
+                               "Parameters": {
+                                   "CultureName": "en-US",
+                                   "Encoding": "ASCII",
+                                   "Filter": "cfn-init.log",
+                                   "LogDirectoryPath": "C:\\cfn\\log",
+                                   "TimeZoneKind": "Local",
+                                   "TimestampFormat": "yyyy-MM-dd HH:mm:ss,fff"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CustomLog.CustomLogInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "IISLogs",
+                               "Parameters": {
+                                   "CultureName": "en-US",
+                                   "Encoding": "UTF-8",
+                                   "Filter": "",
+                                   "LineCount": "3",
+                                   "LogDirectoryPath": "C:\\inetpub\\logs\\LogFiles\\W3SVC1",
+                                   "TimeZoneKind": "UTC",
+                                   "TimestampFormat": "yyyy-MM-dd HH:mm:ss"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.PerformanceCounterComponent.PerformanceCounterInputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "MemoryPerformanceCounter",
+                               "Parameters": {
+                                   "CategoryName": "Memory",
+                                   "CounterName": "Available MBytes",
+                                   "DimensionName": "",
+                                   "DimensionValue": "",
+                                   "InstanceName": "",
+                                   "MetricName": "Memory",
+                                   "Unit": "Megabytes"
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatchApplicationEventLog",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "LogGroup": "${CfnLogGroup}",
+                                   "LogStream": "{instance_id}/ApplicationEventLog",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatchSystemEventLog",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "LogGroup": "${CfnLogGroup}",
+                                   "LogStream": "{instance_id}/SystemEventLog",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatchSecurityEventLog",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "LogGroup": "${CfnLogGroup}",
+                                   "LogStream": "{instance_id}/SecurityEventLog",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatchEC2ConfigLog",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "LogGroup": "${CfnLogGroup}",
+                                   "LogStream": "{instance_id}/EC2ConfigLog",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatchCfnInitLog",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "LogGroup": "${CfnLogGroup}",
+                                   "LogStream": "{instance_id}/CfnInitLog",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatchLogsOutput,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatchIISLogs",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "LogGroup": "${CfnLogGroup}",
+                                   "LogStream": "{instance_id}/IISLogs",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           },
+                           {
+                               "FullName": "AWS.EC2.Windows.CloudWatch.CloudWatch.CloudWatchOutputComponent,AWS.EC2.Windows.CloudWatch",
+                               "Id": "CloudWatch",
+                               "Parameters": {
+                                   "AccessKey": "",
+                                   "NameSpace": "Windows/Default",
+                                   "Region": "${AWS::Region}",
+                                   "SecretKey": ""
+                               }
+                           }
+                       ],
+                       "Flows": {
+                           "Flows": [
+                               "ApplicationEventLog,CloudWatchApplicationEventLog",
+                               "SystemEventLog,CloudWatchSystemEventLog",
+                               "SecurityEventLog,CloudWatchSecurityEventLog",
+                               "EC2ConfigLog,CloudWatchEC2ConfigLog",
+                               "CfnInitLog,CloudWatchCfnInitLog",
+                               "IISLogs,CloudWatchIISLogs",
+                               "MemoryPerformanceCounter,CloudWatch"
+                           ]
+                       },
+                       "PollInterval": "00:00:05"
+                   },
+                   "IsEnabled": true
+                 }
+           commands:
+             0-enableSSM:
+               command: powershell.exe -Command "Set-Service -Name AmazonSSMAgent -StartupType Automatic"
+               waitAfterCompletion: '0'
+             1-restartSSM:
+               command: powershell.exe -Command "Restart-Service AmazonSSMAgent"
+               waitAfterCompletion: '45'
+         01-CopyAndCreateScripts:
+           commands:
+             01_copyEC2scripts:
+               command: powershell.exe -command Copy-S3Object -BucketName ${BucketName} -KeyPrefix 'EC2/scripts' -LocalFolder 'C:\bootstrap' -Force
+               waitAfterCompletion: '0'
+             02_copySQLscripts:
+               command: powershell.exe -command Copy-S3Object -BucketName ${BucketName} -KeyPrefix 'SQL/scripts' -LocalFolder 'C:\bootstrap' -Force
+               waitAfterCompletion: '0'
+             03_installAWSCLI:
+               command: powershell.exe -command msiexec.exe /I "C:\bootstrap\AWSCLIV2.msi" /passive
+               waitAfterCompletion: '0'
+             04_refreshPowershellPath:
+               command: powershell.exe -command  $env:Path = [System.Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path','User')
+               waitAfterCompletion: '0'
+           files:
+             C:\bootstrap\paramstore.json:
+               content: !Sub |
+                 {"DirectoryName":"${DirectoryName}","DomainUser":"${DomainUser}","SecretManagerSecret":"${SecretManagerSecret}","Volume1":"${Volume1}","InstanceName":"${InstanceName}"}
+            # Shell script for test environment
+             C:\bootstrap\restoredbtest.ps1:
+               content: !Sub |
+                 Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+                 Install-Module -Name SqlServer -AllowClobber -Force
+                 New-Item -ItemType Directory -Path 'd:\db'
+                 New-Item -ItemType Directory -Path 'd:\log'
+                 New-Item -ItemType Directory -Path 'd:\mem'
+                 New-Item -ItemType Directory -Path 'e:\backup'
+                 Invoke-Sqlcmd -InputFile 'C:\bootstrap\1-change_sql_mode_to_mixed.sql' -ServerInstance '${InstanceName}'
+                 Restart-Service -Force MSSQLSERVER
+                 Invoke-Sqlcmd -InputFile 'C:\bootstrap\2-Enable_sa_login.sql' -ServerInstance '${InstanceName}'
+                 Invoke-Sqlcmd -InputFile 'C:\bootstrap\3-Set_CostThresholdForParallelism_to_50.sql' -ServerInstance '${InstanceName}'
+                 &"C:\Program Files\Microsoft SQL Server\150\Setup Bootstrap\SQL2019\setup.exe" /QUIET /ACTION=REBUILDDATABASE /INSTANCENAME=MSSQLSERVER /SQLSYSADMINACCOUNTS=BUILTIN\Administrators /SAPWD=Sle001 /SQLCOLLATION=Czech_CI_AS
+
+                 aws s3 cp s3://webinar-bucket/backup/SQL_backup.bak e:\backup\SQL_backup.bak
+
+                 $backupFile = "e:\backup\SQL_backup.bak"
+                 $RelocateData = New-Object "Microsoft.SqlServer.Management.Smo.RelocateFile, $assemblySqlServerSmoExtendedFullName"("Data", "d:\db\Webinar.mdf")
+                 $RelocateLog = New-Object "Microsoft.SqlServer.Management.Smo.RelocateFile, $assemblySqlServerSmoExtendedFullName"("Log", "d:\log\Webinar.ldf")
+                 $myarr=@($RelocateData,$RelocateLog)
+                 Restore-SqlDatabase -ServerInstance '${InstanceName}' -Database 'Webinar' -v $backupFile -RelocateFile $myarr
+             # Shell script for prod environment
+             C:\bootstrap\restoredb.ps1:
+               content: !Sub |
+                 Content of PROD script
+             C:\bootstrap\attach-volume.ps1:
+               content: !Sub |
+                 $InstanceId = $( Invoke-RestMethod http://169.254.169.254/latest/meta-data/instance-id )
+                 $ParamStore = Get-Content -Raw -Path "C:\bootstrap\paramstore.json" | ConvertFrom-Json
+                 $Volume1Id = $ParamStore.Volume1
+                 $Volume2Id = $ParamStore.Volume2
+                 $Volume3Id = $ParamStore.Volume3
+                 $Volume1 = @{
+                     "VolumeId"=$Volume1Id;
+                     "DeviceName"="/dev/sde";
+                     "DriveLetter"="D"
+                 }
+                 $Volume2 = @{
+                     "VolumeId"=$Volume2Id;
+                     "DeviceName"="/dev/sdf";
+                     "DriveLetter"="F"
+                 }
+                 $Volume3 = @{
+                     "VolumeId"=$Volume3Id;
+                     "DeviceName"="/dev/sdg";
+                     "DriveLetter"="G"
+                 }
+                 function attchNvME {
+                   Try {
+                        Get-Disk | Where-Object PartitionStyle -eq RAW | Initialize-Disk -PartitionStyle MBR -PassThru | New-Partition -DriveLetter "E" -UseMaximumSize | Format-Volume -FileSystem NTFS -Confirm:$false
+                   }
+                   Catch [Exception] {
+                   }
+                 }
+
+                 function attchVolume {
+                     Param(
+                         [Parameter(Mandatory=$True)]
+                         [String]
+                         $VolumeId,
+
+                         [Parameter(Mandatory=$True)]
+                         [String]
+                         $DeviceName,
+
+                         [Parameter(Mandatory=$True)]
+                         [String]
+                         $DriveLetter
+                     )
+                     Try {
+                         Add-EC2Volume -VolumeId $VolumeId -InstanceId $InstanceId -Device $DeviceName
+                     }
+                     Catch [Exception] {
+                     }
+                     Start-Sleep -s 5
+                     Try {
+                         Get-Disk | Where-Object PartitionStyle -eq RAW | Initialize-Disk -PartitionStyle MBR -PassThru | New-Partition -DriveLetter $DriveLetter -UseMaximumSize | Format-Volume -FileSystem NTFS -Confirm:$false
+                     }
+                     Catch [Exception] {
+                     }
+                 }
+                 attchNvME
+                 attchVolume @Volume1
+         02-AttachVolumes:
+           commands:
+             00_attachvolumes:
+               command: powershell.exe c:\bootstrap\attach-volume.ps1
+               waitAfterCompletion: '0'
+         03-RenameComputer:
+           commands:
+             00_renamecomputer:
+               command: powershell.exe c:\bootstrap\rename-computer-restart-update.ps1
+               waitAfterCompletion: '30'
+             01_changetimezon:
+               command: powershell.exe Set-TimeZone -Id 'Central Europe Standard Time' -PassThru
+               waitAfterCompletion: '0'
+             02_changeregion:
+               command: powershell.exe Set-Culture -CultureInfo cs-CZ
+               waitAfterCompletion: '0'
+         04-RestoreDB:
+           commands:
+             00_loadassemblies:
+               command: powershell.exe c:\bootstrap\loadassemblies.ps1
+               waitAfterCompletion: '0'
+             01_createtasksfolder:
+               command: powershell.exe new-item -Path 'D:/tasks' -ItemType directory
+               waitAfterCompletion: '0'
+             02_copytasks:
+               command: powershell.exe -command Copy-S3Object -BucketName ${BucketName} -KeyPrefix 'Tasks' -LocalFolder 'D:/tasks' -Force
+               waitAfterCompletion: '0'
+             03_restoredb:
+               command: !If [ isTestCondition, powershell.exe C:\bootstrap\restoredbtest.ps1, powershell.exe C:\bootstrap\restoredb.ps1 ]
+               waitAfterCompletion: '0'
+             04_startagent:
+               command: powershell.exe Set-Service -Name SQLSERVERAGENT -StartupType Automatic -Status Running -PassThru
+               waitAfterCompletion: '0'
+         05-CopyFolders:
+           commands:
+             00_CreateFolder:
+               command: powershell.exe C:\bootstrap\Create_Directory.ps1
+               waitAfterCompletion: '0'
+             01_copydata:
+               command: powershell.exe -command Copy-S3Object -BucketName ${BucketName} -KeyPrefix 'Data' -LocalFolder 'D:/Data' -Force
+               waitAfterCompletion: '0'
+         06-Finalize:
+           commands:
+             00_signal_success:
+               command: !Sub 'cfn-signal.exe --success true --resource ERP --stack ${AWS::StackName} --region ${AWS::Region}'
+               waitAfterCompletion: '0'
+     Properties: 
+        IamInstanceProfile: !Ref 'InstanceProfile'
+        DisableApiTermination: !Ref 'TerminationProtectionInProduction'
+        KeyName: !Ref 'KeyName'
+        ImageId: !Ref 'ImageId'
+        InstanceType: !Ref 'InstanceType'
+        NetworkInterfaces:
+          - NetworkInterfaceId: !Ref 'NetworkInterface'
+            DeviceIndex: 0
+        SsmAssociations:
+          - DocumentName: !Ref 'myDocumentName'
+            AssociationParameters:
+              - Key: "directoryId"
+                Value:
+                  - !Ref 'DirectoryId'
+              - Key: directoryName
+                Value:
+                  - !Ref 'DirectoryName'
+              - Key: dnsIpAddresses
+                Value:
+                  - !Ref 'myDomainNameServer'
+        UserData:
+          Fn::Base64:
+            !Sub |
+            <script>
+            wmic product where "description='Amazon SSM Agent' " uninstall
+            wmic product where "description='aws-cfn-bootstrap' " uninstall
+            start /wait c:\\Windows\\system32\\msiexec /passive /qn /i https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-win64-latest.msi
+            powershell.exe -Command "iwr https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/windows_amd64/AmazonSSMAgentSetup.exe  -UseBasicParsing -OutFile C:\\AmazonSSMAgentSetup.exe"
+            start /wait C:\\AmazonSSMAgentSetup.exe /install /quiet
+            cfn-init.exe --verbose --configsets=config --stack=${AWS::StackName} --resource ERP --region ${AWS::Region}
+            </script>
+        Tags:
+          - Key: Name
+            Value: !Ref 'InstanceName'
+          - Key: Environment
+            Value: !Ref 'DeploymentEnvironment'
+          - Key: Backup
+            Value: Yes
+          - Key: Retention
+            Value: 1
+
+#    *********************************************************************************
+#    ********************         Output data from script         ********************
+#    *********************************************************************************
+Outputs:
+   Instance:
+    Value: !GetAtt [ERP,PrivateIp]
+    Export:
+      Name: !Sub '${AWS::StackName}-ERP-private-IP'

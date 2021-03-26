@@ -1,0 +1,14 @@
+{
+  "Parameters" : {
+    "ManagedResourcePrefix": "TEST-WEBINAR",
+    "DeploymentEnvironment": "test",
+    "AvailabilityZone": "eu-central-1a",
+    "VPCCIDR": "10.20.0.0/16",
+    "PrivateSubnetCIDR" : "10.20.0.0/19",
+    "PublicSubnetCIDR": "10.20.128.0/20",
+    "LogsRetentionInDays": "7",
+    "myDomainName": "webinar.domain",
+    "myDomainNameServer": "10.20.24.123"
+
+  }
+}
